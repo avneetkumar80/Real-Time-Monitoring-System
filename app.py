@@ -2,6 +2,8 @@ import streamlit as st
 import psutil
 import pandas as pd
 from datetime import datetime
+import time
+from collections import deque
 
 # ─── Page Config ───
 st.set_page_config(
@@ -141,6 +143,23 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ─── Session State ───
+if "cpu_history" not in st.session_state:
+    st.session_state.cpu_history = deque(maxlen=50)
+if "memory_history" not in st.session_state:
+    st.session_state.memory_history = deque(maxlen=50)
+if "history_index" not in st.session_state:
+    st.session_state.history_index = deque(maxlen=50)
+if "cpu_threshold" not in st.session_state:
+    st.session_state.cpu_threshold = 80
+if "memory_threshold" not in st.session_state:
+    st.session_state.memory_threshold = 85
+if "last_alert_time" not in st.session_state:
+    st.session_state.last_alert_time = 0.0
+if "tick" not in st.session_state:
+    st.session_state.tick = 0
+
+
 # ─── Helper: color based on value ───
 def get_color_class(value):
     if value < 40:
@@ -158,6 +177,10 @@ disk = psutil.disk_usage('/')
 net = psutil.net_io_counters()
 boot_time = datetime.fromtimestamp(psutil.boot_time())
 uptime = datetime.now() - boot_time
+st.session_state.tick += 1
+st.session_state.history_index.append(st.session_state.tick)
+st.session_state.cpu_history.append(cpu)
+st.session_state.memory_history.append(memory.percent)
 
 # ─── Header ───
 st.markdown(f"""
@@ -221,7 +244,7 @@ with filter_col3:
 
 # Gather process data
 process_data = []
-for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info', 'username', 'status', 'create_time']):
+for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info', 'username', 'status', 'create_time', 'nice']):
     try:
         info = proc.info
         mem_mb = info['memory_info'].rss / (1024 * 1024) if info['memory_info'] else 0.0
@@ -235,6 +258,7 @@ for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info', 'u
             'User': info['username'] or "N/A",
             'CPU %': round(info['cpu_percent'] or 0, 1),
             'Memory (MB)': round(mem_mb, 1),
+            'Priority': info['nice'] if info['nice'] is not None else "N/A",
             'Status': info['status'] or "N/A",
             'Created': created,
         })
@@ -268,6 +292,7 @@ st.dataframe(
         "User": st.column_config.TextColumn("User", width="medium"),
         "CPU %": st.column_config.ProgressColumn("CPU %", min_value=0, max_value=100, format="%.1f%%"),
         "Memory (MB)": st.column_config.NumberColumn("Memory (MB)", format="%.1f"),
+        "Priority": st.column_config.TextColumn("Priority", width="small"),
         "Status": st.column_config.TextColumn("Status", width="small"),
         "Created": st.column_config.TextColumn("Created", width="medium"),
     },
@@ -282,13 +307,107 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+# ─── Process Actions ───
+st.markdown('<div class="section-header">⚙️ Process Controls</div>', unsafe_allow_html=True)
+
+if not df.empty:
+    process_options = {
+        f"{row['Name']} (PID {row['PID']})": int(row["PID"])
+        for _, row in df.iterrows()
+    }
+    selected_label = st.selectbox("Select a process", list(process_options.keys()))
+    selected_pid = process_options[selected_label]
+else:
+    selected_pid = None
+    st.info("No processes available for selection.")
+
+action_col1, action_col2, action_col3, action_col4 = st.columns(4)
+
+def run_process_action(action_name, fn):
+    try:
+        if selected_pid is None:
+            st.warning("Select a process first.")
+            return
+        proc = psutil.Process(selected_pid)
+        fn(proc)
+        st.success(f"{action_name} succeeded for PID {selected_pid}.")
+    except psutil.NoSuchProcess:
+        st.error("That process no longer exists.")
+    except psutil.AccessDenied:
+        st.error("Access denied. Try running Streamlit as Administrator for this action.")
+    except Exception as exc:
+        st.error(f"{action_name} failed: {exc}")
+
+with action_col1:
+    if st.button("⚠️ Kill Process", use_container_width=True):
+        run_process_action("Kill process", lambda proc: proc.terminate())
+
+with action_col2:
+    if st.button("↓ Lower Priority", use_container_width=True):
+        def lower_priority(proc):
+            if psutil.WINDOWS:
+                proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+            else:
+                proc.nice(proc.nice() + 1)
+        run_process_action("Lower priority", lower_priority)
+
+with action_col3:
+    if st.button("↑ Raise Priority", use_container_width=True):
+        def raise_priority(proc):
+            if psutil.WINDOWS:
+                proc.nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+            else:
+                proc.nice(proc.nice() - 1)
+        run_process_action("Raise priority", raise_priority)
+
+with action_col4:
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇ Export Snapshot",
+        data=csv_bytes,
+        file_name=f"process_snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+# ─── Thresholds and Charts ───
+left_col, right_col = st.columns([1, 2])
+
+with left_col:
+    st.markdown('<div class="section-header">🚨 Alert Thresholds</div>', unsafe_allow_html=True)
+    st.session_state.cpu_threshold = st.slider("CPU threshold (%)", 1, 100, st.session_state.cpu_threshold)
+    st.session_state.memory_threshold = st.slider("Memory threshold (%)", 1, 100, st.session_state.memory_threshold)
+
+    now_ts = time.time()
+    threshold_crossed = cpu >= st.session_state.cpu_threshold or memory.percent >= st.session_state.memory_threshold
+    if threshold_crossed and now_ts - st.session_state.last_alert_time >= 45:
+        reasons = []
+        if cpu >= st.session_state.cpu_threshold:
+            reasons.append(f"CPU {cpu:.1f}%")
+        if memory.percent >= st.session_state.memory_threshold:
+            reasons.append(f"Memory {memory.percent:.1f}%")
+        st.warning("Threshold exceeded: " + " • ".join(reasons))
+        st.session_state.last_alert_time = now_ts
+    else:
+        st.caption("Alerts use a 45-second cooldown to avoid noise.")
+
+with right_col:
+    st.markdown('<div class="section-header">📈 Resource Trends</div>', unsafe_allow_html=True)
+    chart_df = pd.DataFrame(
+        {
+            "CPU Usage (%)": list(st.session_state.cpu_history),
+            "Memory Usage (%)": list(st.session_state.memory_history),
+        },
+        index=list(st.session_state.history_index),
+    )
+    st.line_chart(chart_df, height=260)
+
 # ─── Auto-refresh ───
 st.markdown("<div style='height: 16px'></div>", unsafe_allow_html=True)
 auto_refresh = st.checkbox("🔄 Auto-refresh (every 5 seconds)", value=False)
 
 if auto_refresh:
-    import time as _time
-    _time.sleep(5)
+    time.sleep(5)
     st.rerun()
 
 # ─── Footer ───
