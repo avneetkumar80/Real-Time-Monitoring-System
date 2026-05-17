@@ -3,7 +3,6 @@
 ## 📌 Overview
 
 <img width="1898" height="939" alt="image" src="https://github.com/user-attachments/assets/1cacbe87-5ed5-4d2e-976b-20aaf24eb7e2" />
-)
 
 Real-Time Process Monitoring is a Python-based monitoring dashboard that provides live insights into system processes and resource usage.
 
