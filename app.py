@@ -4,6 +4,7 @@ import pandas as pd
 from datetime import datetime
 import time
 from collections import deque
+from pathlib import Path
 
 # ─── Page Config ───
 st.set_page_config(
@@ -162,6 +163,12 @@ if "cached_process_data" not in st.session_state:
     st.session_state.cached_process_data = []
 if "last_process_refresh" not in st.session_state:
     st.session_state.last_process_refresh = 0.0
+if "last_disk_counters" not in st.session_state:
+    st.session_state.last_disk_counters = None
+if "last_net_counters" not in st.session_state:
+    st.session_state.last_net_counters = None
+if "last_io_sample_time" not in st.session_state:
+    st.session_state.last_io_sample_time = None
 
 
 # ─── Helper: color based on value ───
@@ -178,8 +185,26 @@ def get_color_class(value):
 # Keep the sampling window short so the monitor stays responsive and adds less load itself.
 cpu = psutil.cpu_percent(interval=0.1)
 memory = psutil.virtual_memory()
-disk = psutil.disk_usage('/')
+system_drive = Path.cwd().anchor or "/"
+disk = psutil.disk_usage(system_drive)
+disk_io = psutil.disk_io_counters()
 net = psutil.net_io_counters()
+now_sample_time = time.time()
+
+if st.session_state.last_io_sample_time is not None:
+    elapsed = max(now_sample_time - st.session_state.last_io_sample_time, 0.001)
+    prev_disk = st.session_state.last_disk_counters
+    prev_net = st.session_state.last_net_counters
+    disk_read_rate = ((disk_io.read_bytes - prev_disk.read_bytes) / elapsed) if disk_io and prev_disk else 0.0
+    disk_write_rate = ((disk_io.write_bytes - prev_disk.write_bytes) / elapsed) if disk_io and prev_disk else 0.0
+    net_sent_rate = ((net.bytes_sent - prev_net.bytes_sent) / elapsed) if prev_net else 0.0
+    net_recv_rate = ((net.bytes_recv - prev_net.bytes_recv) / elapsed) if prev_net else 0.0
+else:
+    disk_read_rate = disk_write_rate = net_sent_rate = net_recv_rate = 0.0
+
+st.session_state.last_disk_counters = disk_io
+st.session_state.last_net_counters = net
+st.session_state.last_io_sample_time = now_sample_time
 boot_time = datetime.fromtimestamp(psutil.boot_time())
 uptime = datetime.now() - boot_time
 st.session_state.tick += 1
@@ -202,22 +227,35 @@ col1, col2, col3, col4 = st.columns(4)
 
 metrics = [
     (col1, "🔥", "CPU Usage", cpu, "%"),
-    (col2, "💾", "Memory", memory.percent, f"% — {memory.used // (1024**3)}/{memory.total // (1024**3)} GB"),
-    (col3, "💿", "Disk", disk.percent, f"% — {disk.used // (1024**3)}/{disk.total // (1024**3)} GB"),
-    (col4, "🌐", "Network ↑↓", 0, f"{net.bytes_sent // (1024**2)} / {net.bytes_recv // (1024**2)} MB"),
+    (col2, "💾", "Memory", memory.percent, f"% — {memory.used / (1024**3):.1f}/{memory.total / (1024**3):.1f} GB"),
+    (col3, "💿", "Disk", disk.percent, f"Used — {disk.used // (1024**3)}/{disk.total // (1024**3)} GB"),
+    (col4, "🌐", "Network ↑↓", 0, ""),
 ]
 
 for col, icon, label, value, suffix in metrics:
     color = get_color_class(value) if value > 0 else "blue"
     with col:
         if label == "Network ↑↓":
-            display_val = f"{net.bytes_sent // (1024**2)}/{net.bytes_recv // (1024**2)}"
+            display_val = f"{net_sent_rate / (1024**2):.2f}/{net_recv_rate / (1024**2):.2f}"
             st.markdown(f"""
             <div class="metric-card">
                 <div class="metric-icon">{icon}</div>
                 <div class="metric-label">{label}</div>
-                <div class="metric-value color-{color}">{display_val}</div>
-                <div style="color: #A0B4C8; font-size: 12px;">MB sent / received</div>
+                <div class="metric-value color-blue">{display_val}</div>
+                <div style="color: #A0B4C8; font-size: 12px;">MB/s sent / received</div>
+            </div>
+            """, unsafe_allow_html=True)
+        elif label == "Disk":
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-icon">{icon}</div>
+                <div class="metric-label">{label}</div>
+                <div class="metric-value color-{color}">{value:.1f}%</div>
+                <div class="metric-bar-bg">
+                    <div class="metric-bar bar-{color}" style="width: {value}%;"></div>
+                </div>
+                <div style="color: #64748B; font-size: 11px; margin-top: 6px;">{suffix}</div>
+                <div style="color: #A0B4C8; font-size: 12px; margin-top: 4px;">R {disk_read_rate / (1024**2):.2f} / W {disk_write_rate / (1024**2):.2f} MB/s</div>
             </div>
             """, unsafe_allow_html=True)
         else:
@@ -251,25 +289,49 @@ with filter_col3:
 refresh_processes = time.time() - st.session_state.last_process_refresh >= 3
 if refresh_processes or not st.session_state.cached_process_data:
     process_data = []
-    for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info', 'username', 'status', 'create_time', 'nice']):
+    for proc in psutil.process_iter(['pid', 'name']):
         try:
-            info = proc.info
-            mem_mb = info['memory_info'].rss / (1024 * 1024) if info['memory_info'] else 0.0
-            try:
-                created = datetime.fromtimestamp(info['create_time']).strftime('%Y-%m-%d %H:%M') if info['create_time'] else "N/A"
-            except (OSError, ValueError):
-                created = "N/A"
+            with proc.oneshot():
+                pid = proc.pid
+                try:
+                    name = proc.name() or "N/A"
+                except (psutil.AccessDenied, psutil.ZombieProcess):
+                    name = "N/A"
+                try:
+                    username = proc.username() or "N/A"
+                except (psutil.AccessDenied, psutil.ZombieProcess):
+                    username = "N/A"
+                try:
+                    cpu_percent = proc.cpu_percent(interval=None)
+                except (psutil.AccessDenied, psutil.ZombieProcess):
+                    cpu_percent = 0.0
+                try:
+                    mem_mb = proc.memory_info().rss / (1024 * 1024)
+                except (psutil.AccessDenied, psutil.ZombieProcess):
+                    mem_mb = 0.0
+                try:
+                    priority = proc.nice()
+                except (psutil.AccessDenied, psutil.ZombieProcess):
+                    priority = "N/A"
+                try:
+                    status = proc.status() or "N/A"
+                except (psutil.AccessDenied, psutil.ZombieProcess):
+                    status = "N/A"
+                try:
+                    created = datetime.fromtimestamp(proc.create_time()).strftime('%Y-%m-%d %H:%M')
+                except (psutil.AccessDenied, psutil.ZombieProcess, OSError, ValueError):
+                    created = "N/A"
             process_data.append({
-                'PID': info['pid'],
-                'Name': info['name'] or "N/A",
-                'User': info['username'] or "N/A",
-                'CPU %': round(info['cpu_percent'] or 0, 1),
+                'PID': pid,
+                'Name': name,
+                'User': username,
+                'CPU %': round(cpu_percent or 0, 1),
                 'Memory (MB)': round(mem_mb, 1),
-                'Priority': info['nice'] if info['nice'] is not None else "N/A",
-                'Status': info['status'] or "N/A",
+                'Priority': priority,
+                'Status': status,
                 'Created': created,
             })
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
             continue
     st.session_state.cached_process_data = process_data
     st.session_state.last_process_refresh = time.time()
