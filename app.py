@@ -158,6 +158,10 @@ if "last_alert_time" not in st.session_state:
     st.session_state.last_alert_time = 0.0
 if "tick" not in st.session_state:
     st.session_state.tick = 0
+if "cached_process_data" not in st.session_state:
+    st.session_state.cached_process_data = []
+if "last_process_refresh" not in st.session_state:
+    st.session_state.last_process_refresh = 0.0
 
 
 # ─── Helper: color based on value ───
@@ -171,7 +175,8 @@ def get_color_class(value):
 
 
 # ─── System Metrics ───
-cpu = psutil.cpu_percent(interval=0.5)
+# Keep the sampling window short so the monitor stays responsive and adds less load itself.
+cpu = psutil.cpu_percent(interval=0.1)
 memory = psutil.virtual_memory()
 disk = psutil.disk_usage('/')
 net = psutil.net_io_counters()
@@ -242,28 +247,34 @@ with filter_col2:
 with filter_col3:
     sort_order = st.selectbox("Order", ["Descending", "Ascending"], label_visibility="collapsed")
 
-# Gather process data
-process_data = []
-for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info', 'username', 'status', 'create_time', 'nice']):
-    try:
-        info = proc.info
-        mem_mb = info['memory_info'].rss / (1024 * 1024) if info['memory_info'] else 0.0
+# Gather process data less often than top-line metrics. This keeps live mode light.
+refresh_processes = time.time() - st.session_state.last_process_refresh >= 3
+if refresh_processes or not st.session_state.cached_process_data:
+    process_data = []
+    for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info', 'username', 'status', 'create_time', 'nice']):
         try:
-            created = datetime.fromtimestamp(info['create_time']).strftime('%Y-%m-%d %H:%M') if info['create_time'] else "N/A"
-        except (OSError, ValueError):
-            created = "N/A"
-        process_data.append({
-            'PID': info['pid'],
-            'Name': info['name'] or "N/A",
-            'User': info['username'] or "N/A",
-            'CPU %': round(info['cpu_percent'] or 0, 1),
-            'Memory (MB)': round(mem_mb, 1),
-            'Priority': info['nice'] if info['nice'] is not None else "N/A",
-            'Status': info['status'] or "N/A",
-            'Created': created,
-        })
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-        continue
+            info = proc.info
+            mem_mb = info['memory_info'].rss / (1024 * 1024) if info['memory_info'] else 0.0
+            try:
+                created = datetime.fromtimestamp(info['create_time']).strftime('%Y-%m-%d %H:%M') if info['create_time'] else "N/A"
+            except (OSError, ValueError):
+                created = "N/A"
+            process_data.append({
+                'PID': info['pid'],
+                'Name': info['name'] or "N/A",
+                'User': info['username'] or "N/A",
+                'CPU %': round(info['cpu_percent'] or 0, 1),
+                'Memory (MB)': round(mem_mb, 1),
+                'Priority': info['nice'] if info['nice'] is not None else "N/A",
+                'Status': info['status'] or "N/A",
+                'Created': created,
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    st.session_state.cached_process_data = process_data
+    st.session_state.last_process_refresh = time.time()
+else:
+    process_data = st.session_state.cached_process_data
 
 df = pd.DataFrame(process_data)
 
@@ -402,12 +413,17 @@ with right_col:
     )
     st.line_chart(chart_df, height=260)
 
-# ─── Auto-refresh ───
+# ─── Live Refresh ───
 st.markdown("<div style='height: 16px'></div>", unsafe_allow_html=True)
-auto_refresh = st.checkbox("🔄 Auto-refresh (every 5 seconds)", value=False)
+refresh_col1, refresh_col2 = st.columns([2, 1])
+with refresh_col1:
+    auto_refresh = st.checkbox("🔴 Live mode", value=True)
+with refresh_col2:
+    refresh_seconds = st.slider("Refresh every (seconds)", 1, 10, 2)
 
 if auto_refresh:
-    time.sleep(5)
+    st.caption("Metrics update live; the heavier process table refreshes every 3 seconds to keep dashboard overhead low.")
+    time.sleep(refresh_seconds)
     st.rerun()
 
 # ─── Footer ───
